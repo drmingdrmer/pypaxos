@@ -86,8 +86,8 @@ class Candidate( paxos.PaxosBase ):
             time.sleep( 0.5 )
 
     def __del__( self ):
-        self.close()
+        self.shutdown()
 
-    def close( self ):
+    def shutdown( self ):
         self.elect_running = False
         self.srv.shutdown()

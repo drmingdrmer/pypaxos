@@ -69,7 +69,7 @@ class TestCandidate( Base ):
                      'vrnd with which leader established is leader version' )
             time.sleep( 0.3 )
 
-        self.candidates[ leaders[ 0 ] ].close()
+        self.candidates[ leaders[ 0 ] ].shutdown()
         del self.candidates[ leaders[ 0 ] ]
 
         time.sleep( 4 )
