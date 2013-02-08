@@ -1,4 +1,4 @@
-pyelect
+pypaxos
 =======
 
-pure python leader election implementation
+pure python paxos implementation
