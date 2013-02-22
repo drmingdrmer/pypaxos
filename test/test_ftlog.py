@@ -483,6 +483,7 @@ class TestLeaderTransition( Base ):
 
 if __name__ == "__main__":
 
+    # testframe.run_single( TestRW, 'test_rw' )
     # testframe.run_single( TestRW, 'test_work_with_2' )
     # testframe.run_single( TestRW, 'test_read_with_leader_constrain' )
     # testframe.run_single( TestRW, 'test_leader_with_greatest_log' )

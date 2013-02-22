@@ -94,6 +94,7 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
         if rlog.pause_log_rw:
             return self.resp_udf_err( 'ServerDisabled', *rlog.status )
 
+        t0 = paxos.make_ts()
 
         leader = Leader( *rlog.leader )
         myident = rlog.ident
@@ -110,6 +111,13 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
 
             logbuf = paxos.dump( rec )
             (seq, next_seq), err = rlog.mylog.write( logbuf )
+            if err:
+                return self.resp_err( err )
+
+            rlog.p2_seq = next_seq
+
+        rlog.logger.info( 'after acc local:' + str( paxos.make_ts() - t0 ) )
+        t0 = paxos.make_ts()
 
         # There is no more than 2 valid leader in system. Thus we do not need
         # to lock.
@@ -121,18 +129,32 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
         (n_acc, errs), err = rlog.send_mes( '/p2', p2req )
         n_acc += 1 # 1 for leader itself
 
+        rlog.logger.info( 'after acc remote:' + str( paxos.make_ts() - t0 ) )
+        t0 = paxos.make_ts()
+
         quorum = len(rlog.cluster) / 2 + 1
         if n_acc < quorum:
-            self.resp_udf_err( 'QuorumError', *errs )
-            return
+            return self.resp_udf_err( 'QuorumError', *errs )
 
-        rlog.commit_nolock( seq, rec )
+        _, err = rlog.commit_nolock( seq )
+        if err:
+            rlog.logger.error( rlog.ident + ' '
+                               + repr( err ) + ' while commit '
+                               + repr( seq ) )
+            return self.resp_err( err )
+
+        rlog.logger.info( 'after commit local:' + str( paxos.make_ts() - t0 ) )
+        t0 = paxos.make_ts()
 
         commit_req = paxos.dump( { 'seq': seq,
                                    'next_seq': next_seq,
                                    'rec': rec } )
 
         (n_acc, errs), err = rlog.send_mes( '/commit', commit_req )
+
+        rlog.logger.info( 'after commit remote:' + str( paxos.make_ts() - t0 ) )
+        t0 = paxos.make_ts()
+
         self.resp( 200, ( ( seq, next_seq ), None ) )
 
 
@@ -199,7 +221,6 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
             return self.resp_udf_err( 'ServerDisabled', *rlog.status )
         req = self.req
         seq = req[ 'seq' ]
-        rec = LogRecord( *req[ 'rec' ] )
 
         if rlog.catchingup:
             self.resp_udf_err( 'CatchingUp' )
@@ -209,7 +230,7 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
         # legal. but we still need to keep the order.
         with rlog.leader_lock:
 
-            _, err = rlog.commit_nolock( seq, rec )
+            _, err = rlog.commit_nolock( seq )
 
             if err:
                 leader = rlog.leader
@@ -503,6 +524,7 @@ class ReliableLog( paxos.PaxosBase ):
 
                 commit_seq = self.commit_seq
                 time.sleep( 0.1 )
+
                 if self.leader.ident == self.ident \
                         and commit_seq == self.commit_seq:
 
@@ -535,6 +557,9 @@ class ReliableLog( paxos.PaxosBase ):
                 if err:
                     self.logger.error( self.ident + ' Leader Catch up failed:' + repr( err ) )
                     return None, err
+
+                with self.leader_lock:
+                    self.p2_seq = self.mylog.seq
 
                 self.leader = leader
 
@@ -667,7 +692,7 @@ class ReliableLog( paxos.PaxosBase ):
 
             rec = LogRecord( *paxos.load( buf ) )
             rc, err = self.reexcecute_rec_nolock( seq, next_seq, rec )
-            self.logger.info( self.ident + ' re-exec result: ' + repr( (rc, err) ) )
+            self.logger.info( self.ident + ' re-exec result: ' + repr( (seq, rc, err) ) )
             if err:
                 self.logger.info( repr( err ) + ' while reexec' )
                 # maybe not enough quorum
@@ -692,16 +717,17 @@ class ReliableLog( paxos.PaxosBase ):
 
         quorum = len(self.cluster) / 2 + 1
         if n_acc < quorum:
-            err = ( 'QuorumError', () )
+            err = ( 'QuorumError', errs )
             return None, err
 
-        self.commit_nolock( seq, rec )
+        self.commit_nolock( seq )
 
         commit_req = paxos.dump( { 'seq': seq,
-                                   'next_seq': next_seq,
-                                   'rec': rec } )
+                                   'next_seq': next_seq, } )
 
         (n_acc, errs), err = self.send_mes( '/commit', commit_req )
+        if err:
+            self.logger.info( self.ident + ' re-exec errors:' + repr( errs ) )
 
         return None, None
 
@@ -727,10 +753,10 @@ class ReliableLog( paxos.PaxosBase ):
 
             if err:
                 if err.err == 'OutofRange':
-                    self.logger.info( self.ident + ' OK catchup finished: ' + repr( rst ) )
+                    self.logger.info( self.ident + ' OK catchup finished: ' + repr( (seq, rst) ) )
                     return None, None
                 else:
-                    self.logger.info( self.ident + ' Failure catchup /read: ' + repr( err ) )
+                    self.logger.info( self.ident + ' Failure catchup /read: ' + repr( (seq, err) ) )
                     return None, err
             else:
                 self.logger.debug( self.ident + ' OK /read: ' + repr( resp ) )
@@ -799,45 +825,40 @@ class ReliableLog( paxos.PaxosBase ):
                         return None, None
 
             if commit_seq > self.commit_seq:
-                rc, err = self.commit_nolock( seq, rec )
+                rc, err = self.commit_nolock( seq )
                 if err:
                     return None, err
 
             seq = next_seq
 
 
-    def commit_nolock( self, seq, rec ):
+    def commit_nolock( self, seq ):
 
-        self.logger.debug( self.ident + " to commit:" + repr( ( seq, rec ) ) )
+        self.logger.debug( self.ident + " to commit:" + repr( seq ) )
         if self.commit_seq > seq:
             # already committed
             return None, None
 
         if self.commit_seq < seq:
             err = ( 'InvalidSeq', (self.commit_seq, seq) )
-            self.logger.debug( self.ident + " " + repr( err ) + ' while commit: ' + repr( ( seq, rec ) ) )
+            self.logger.debug( self.ident + " " + repr( err ) + ' while commit: ' + repr( seq ) )
             # there might be a commit message gets lost
             return None, err
 
         # if self.commit_seq == seq:
 
-        (myseq, mynext_seq, myrecbuf), err = self.mylog.read( seq )
-        if err:
-            return None, err
+        if self.p2_seq > seq:
 
-        myrec = LogRecord( *paxos.load( myrecbuf ) )
+            (myseq, mynext_seq, myrecbuf), err = self.mylog.read( seq )
+            if err:
+                return None, err
 
-        # if leader matches, not possible that data does not match.
-        if rec.leader_ver == myrec.leader_ver:
             self.commit_seq = mynext_seq
-
-            self.logger.debug( self.ident + ' committed:' + repr(rec) )
+            self.logger.debug( self.ident + ' committed:' + repr(seq) )
             return None, None
 
         else:
-            self.logger.debug( self.ident + ' rec not the same, mine: ' + repr( myrec ) )
-            self.logger.debug( self.ident + ' rec not the same, to commit: ' + repr( rec ) )
-            return None, ( 'WrongLeader', () )
+            return None, Error( 'SeqNotAccepted', ( self.p2_seq, seq ) )
 
 
     def send_mes( self, uri, body ):
