@@ -424,7 +424,7 @@ class Proposer( PaxosBase, RndManager ):
 class Acceptor( PaxosBase ):
 
     def __init__( self, ident, cluster,
-                  paxos_storage, time_window=TIME_WINDOW,
+                  paxos_storage, time_window=None,
                   **argkv ):
 
         PaxosBase.__init__( self, ident, cluster, **argkv )
@@ -433,7 +433,7 @@ class Acceptor( PaxosBase ):
             assert ident in self.cluster
 
         self.sto = paxos_storage
-        self.time_window = time_window
+        self.time_window = time_window or TIME_WINDOW
 
     def cluster_hashes( self ):
         # implementation based
