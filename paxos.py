@@ -932,7 +932,8 @@ def make_rpc_proxy( cluster ):
     return _rpc
 
 
-def http_rpc( dest_dic, req, timeout=REQUEST_TIMEOUT ):
+def http_rpc( dest_dic, req, timeout=None ):
+    timeout = timeout or REQUEST_TIMEOUT
     r = {}
     data = dump( req )
     for ident, dest in dest_dic.items():
@@ -942,7 +943,8 @@ def http_rpc( dest_dic, req, timeout=REQUEST_TIMEOUT ):
 
     return r
 
-def http( ip, port, uri, headers={}, body=None, timeout=REQUEST_TIMEOUT ):
+def http( ip, port, uri, headers={}, body=None, timeout=None ):
+    timeout = timeout or REQUEST_TIMEOUT
     try:
         c = httplib.HTTPConnection( ip, port, timeout=timeout )
         c.request( 'GET', uri, headers=headers, body=body )
