@@ -109,7 +109,7 @@ class Base( testframe.TestFrame ):
                 _r, err = self.cli.read( seq, ident=ident )
                 self.eq( None, err, 'read from ' + ident + ' seq=' + str(seq) )
 
-                (commit_seq, ver, leader_ver, v_resp) = _r
+                (commit_seq, s, e), ( ver, leader_ver, v_resp) = _r
                 dd( "read from " + ident + " v=" + v_resp )
                 self.eq( v, v_resp, 'read from ' + ident + ' seq=' + str(seq) )
 
@@ -186,10 +186,12 @@ class TestRW( Base ):
             r, err = self.cli.read( seq, ident=ident )
             dd( 'read r, err=' + repr( ( r, err ) ) )
             self.eq( None, err )
-            commit_seq, ver, leader_ver, v = r
+            (commit_seq, s, e), (ver, leader_ver, v) = r
 
             self.eq( val, v, 'Get value from:' + ident
                      + ' Leader is ' + self.leader )
+
+            self.true( commit_seq > seq )
 
 
     def test_read_without_leader_constrain( self ):
@@ -199,7 +201,8 @@ class TestRW( Base ):
 
         for ident in self.cluster:
 
-            (commit_seq, ver, leader_ver, v), err = self.cli.read( seq=0, ident=ident )
+            r, err = self.cli.read( seq=0, ident=ident )
+            (commit_seq, _seq, _next_seq), ( ver, leader_ver, v) = r
 
             dd( commit_seq, ver, leader_ver, v, err )
             self.eq( None, err )
@@ -379,6 +382,32 @@ class TestLeaderTransition( Base ):
         self.eq( 0, err.val[ 0 ] )
         self.eq( next_seq, err.val[ 1 ] )
 
+    def test_refuse_commit_from_non_leader( self ):
+
+        f0 = self.follower_ids[ 0 ]
+
+        node = self.cluster[ f0 ]
+        ip, port = node[ 'addrs' ][ 0 ]
+
+        cmtreq = paxos.dump( { 'leader': self.full_leader,
+                              'seq': 0,
+                               } )
+
+        resp, err = paxos.http( ip, port, '/commit', body=cmtreq )
+
+        self.neq( None, err )
+        self.eq( 'SeqNotAccepted', err.err )
+
+
+        time.sleep( 1 )
+        cmtreq = paxos.dump( { 'leader': ( f0, 100 ),
+                              'seq': 0,
+                               } )
+
+        resp, err = paxos.http( ip, port, '/commit', body=cmtreq )
+
+        self.neq( None, err )
+        self.eq( 'WrongLeader', err.err )
 
     def test_non_accepted_accumulate( self ):
 
@@ -488,9 +517,9 @@ if __name__ == "__main__":
     # testframe.run_single( TestRW, 'test_read_with_leader_constrain' )
     # testframe.run_single( TestRW, 'test_leader_with_greatest_log' )
     # testframe.run_single( TestRW, 'test_discard_non_accepted' )
-    # testframe.run_single( TestLeaderTransition, 'test_refuse_p2_without_catchup' )
-    testframe.run_single( TestPersistent, 'test_commit_seq_persistent' )
-    sys.exit()
+    # testframe.run_single( TestLeaderTransition, 'test_refuse_commit_from_non_leader' )
+    # testframe.run_single( TestPersistent, 'test_commit_seq_persistent' )
+    # sys.exit()
 
     suite = unittest.TestSuite()
     loader = unittest.TestLoader()
