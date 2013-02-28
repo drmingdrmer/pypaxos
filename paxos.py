@@ -1013,12 +1013,9 @@ def _cluster_hash( cluster ):
     ks = cluster.keys()
     ks.sort()
 
-    s = [ ( k, cluster[ k ][ 'addrs' ] )
-          for k in ks ]
-
-    s = [ repr( x ) for x in s ]
+    s = [ str( x ) for x in ks ]
     s = ' '.join( s )
-    return hashlib.md5( s ).hexdigest()[ :8 ]
+    return hashlib.md5( s ).hexdigest().lower()[ :8 ]
 
 def _addr_ipport( addr ):
 

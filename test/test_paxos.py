@@ -107,6 +107,32 @@ class Base( testframe.TestFrame ):
             self.cluster[ k ] = { 'addrs':[ ( '127.0.0.1', 7801+i ) ] }
 
 
+class TestClusterHash( Base ):
+
+    def setUp( self ):
+        self._make_cluster( 3 )
+
+    def test_hash( self ):
+
+        hsh = paxos._cluster_hash( self.cluster )
+        self.eq( hsh.lower(), hsh )
+
+    def test_hash_diff( self ):
+
+        hsh = paxos._cluster_hash( self.cluster )
+
+        self._make_cluster( 4 )
+        hsh_4 = paxos._cluster_hash( self.cluster )
+        self.neq( hsh, hsh_4 )
+
+    def test_hash_affected_only_by_keys( self ):
+
+        hsh = paxos._cluster_hash( self.cluster )
+        self.cluster[ 'a' ] = '127.0.0.1:12345'
+
+        hsh_val_changed = paxos._cluster_hash( self.cluster )
+        self.eq( hsh, hsh_val_changed )
+
 class TestFilePaxosStorage( testframe.TestFrame ):
 
     fn = 'tmp-storage'
@@ -1663,6 +1689,7 @@ if __name__ == "__main__":
     classes = (
             TestRndNumber,
             TestRndManager,
+            TestClusterHash,
             TestFilePaxosStorage,
             TestFilePaxosStorage_Rnd3,
             TestAcceptor,
