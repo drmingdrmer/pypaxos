@@ -9,6 +9,7 @@ import time
 import logging, traceback
 import json
 import threading
+import SocketServer
 import BaseHTTPServer
 import httplib
 
@@ -897,7 +898,7 @@ class SingleAcceptorHandler( HttpHandler ):
         self.resp( 200, w( req ) )
 
 
-class SingleAcceptorServer( BaseHTTPServer.HTTPServer ):
+class SingleAcceptorServer( SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer ):
 
     handler_class = SingleAcceptorHandler
 
