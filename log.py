@@ -669,7 +669,7 @@ class Log( object ):
 
     def read_block_nocheck( self, rseq ):
 
-        none = ( None, None )
+        none = ( None, None, None )
         logger.debug( 'read from: ' + repr( rseq ) )
 
         i, offset = self.seq_to_ioff( rseq )
