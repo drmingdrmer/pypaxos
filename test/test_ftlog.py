@@ -372,8 +372,9 @@ class TestLeaderTransition( Base ):
         ip, port = node[ 'addrs' ][ 0 ]
 
         p2req = paxos.dump( { 'leader': self.full_leader,
-                              'seq': next_seq,
-                              'rec': ftlog.LogRecord( 1, self.full_leader[1], 'xyz' ) } )
+                              'recs': [ ( next_seq,
+                                          ftlog.LogRecord( 1, self.full_leader[1], 'xyz' ) ) ]
+        } )
 
         resp, err = paxos.http( ip, port, '/p2', body=p2req )
 

@@ -99,7 +99,6 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
         leader = Leader( *rlog.leader )
         myident = rlog.ident
 
-        rlog.logger.info( "Start write" )
         with rlog.leader_lock:
             # if leader changes, no log should be written
 
@@ -110,78 +109,41 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
 
             rec = LogRecord( 1, leader.ver, self.body )
 
-            logbuf = paxos.dump( rec )
-            (seq, next_seq), err = rlog.mylog.write( logbuf )
+            seq = rlog.local_acc_seq
+
+
+            acc_seq, err = rlog.do_accept_nolock( rec )
             if err:
                 return self.resp_err( err )
 
-            rlog.p2_seq = next_seq
-
-        rlog.logger.info( 'after acc local:' + str( paxos.make_ts() - t0 ) )
-        t0 = paxos.make_ts()
-
-        # There is no more than 2 valid leader in system. Thus we do not need
-        # to lock.
-
-        p2req = paxos.dump( { 'leader': leader,
-                              'seq': seq,
-                              'rec': rec } )
-
-
-        n_acc = 0
-        ids = [ x for x in rlog.cluster if x != rlog.ident ]
-        rsts = []
-        evs = []
-        errs = []
-
-        for ident in ids:
             ev = threading.Event()
-            rlog.msg_queue.put( ( ident, rsts, ev, { "uri": "/p2",
-                                              "body": p2req,
-                                              "timeout": 0.1 } ) )
-            evs.append( ev )
 
-        timeout = 200
-        left = 200
-        rlog.logger.info( 'after put p2 to queue:' + str( paxos.make_ts() - t0 ) )
-        t0 = paxos.make_ts()
+            for ident in rlog.cluster:
+                if ident == rlog.ident:
+                    continue
 
-        for ev in evs:
-            ev.wait( timeout )
-            ident, resp, err = rsts.pop()
+                rlog.p2_send_q.put( ( rlog.leader, ident ) )
 
-            rlog.logger.info( 'From ' + ident
-                               + ' resp: ' + repr( ( resp, err ) ) )
-            if err:
-                errs.append( (ident, err) )
-            else:
-                n_acc += 1
+            rlog.waiting_evs.append( ( seq, ev ) )
 
-        n_acc += 1 # 1 for leader itself
+        # rlog.logger.info( 'after acc local:' + str( paxos.make_ts() - t0 ) )
+        # t0 = paxos.make_ts()
 
-        rlog.logger.info( 'after acc remote:' + str( paxos.make_ts() - t0 ) )
-        t0 = paxos.make_ts()
-
-        quorum = len(rlog.cluster) / 2 + 1
-        if n_acc < quorum:
-            return self.resp_udf_err( 'QuorumError', *errs )
+        ev.wait( 0.2 )
 
         with rlog.leader_lock:
+            if rlog.group_acc_seq <= seq:
+                rlog.logger.info( rlog.ident + ' Failure /write:--------' )
+                # TODO elaborate error
+                return self.resp( 200, ( None, Error( 'QuorumError', () ) ) )
 
-            if leader == rlog.leader:
+            rlog.logger.info( rlog.ident
+                              + ' h_write /p2 OK: group_acc_seq: ' + repr( rlog.group_acc_seq ) )
 
-                _, err = rlog.commit_nolock( seq )
-                if err:
-                    rlog.logger.error( rlog.ident + ' '
-                                       + repr( err ) + ' while commit '
-                                       + repr( seq ) )
-                    return self.resp_err( err )
+        # rlog.logger.info( 'after acc remote:' + str( paxos.make_ts() - t0 ) )
+        # t0 = paxos.make_ts()
 
-                rlog.logger.info( 'after commit local:' + str( paxos.make_ts() - t0 ) )
-
-                rlog.commit_queue.put( ( leader, seq ) )
-
-        self.resp( 200, ( ( seq, next_seq ), None ) )
+        self.resp( 200, ( ( seq, acc_seq ), None ) )
 
 
     def h_p2( self ):
@@ -190,10 +152,8 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
         rlog = self.server.rlog
         if rlog.pause_log_rw:
             return self.resp_udf_err( 'ServerDisabled', *rlog.status )
-        localleader = Leader(*rlog.leader)
+
         fromleader = Leader( *req[ 'leader' ] )
-        rec = LogRecord( *req[ 'rec' ] )
-        ver, leader_ver, v = rec
 
         if rlog.catchingup:
             self.resp_udf_err( 'CatchingUp' )
@@ -201,42 +161,16 @@ class LogRequestHandler( paxos.SingleAcceptorHandler ):
 
         with rlog.leader_lock:
 
-            if fromleader != localleader:
-                self.resp_udf_err( 'WrongLeader', localleader, fromleader )
-                return
+            for seq, rec in req[ 'recs' ]:
 
-            if rlog.p2_seq < req[ 'seq' ]:
-                rlog.catchup_queue.put( ( localleader.ident, localleader ) )
-                self.resp_udf_err( 'InvalidPhase2Seq', rlog.p2_seq, req[ 'seq' ] )
-                return
+                rlog.logger.info( rlog.ident + ' to accept: ' + repr( ( seq, rec ) ) )
 
-            if req[ 'seq' ] == rlog.mylog.seq:
-                logbuf = paxos.dump( rec )
-                (seq, next_seq), err = rlog.mylog.write( logbuf )
+                rec = LogRecord( *rec )
+                r, err = rlog.accept_nolock( fromleader, seq, rec )
                 if err:
                     return self.resp_err( err )
 
-                rlog.p2_seq = next_seq
-
-                self.resp( 200, ( None, None ) )
-                return
-
-            if req[ 'seq' ] < rlog.mylog.seq:
-                (myseq, mynext_seq, myrec), err = rlog.mylog.read( req[ 'seq' ] )
-                if err:
-                    rlog.logger.debug( repr( err ) + ' while  p2' )
-                    return self.resp_err( err )
-                else:
-                    myrec = LogRecord( *paxos.load( myrec ) )
-                    rlog.logger.debug( rlog.ident + ' p2 existent rec: ' + repr( rec ) )
-                    rlog.logger.debug( rlog.ident + ' p2 existent my : ' + repr( myrec ) )
-                    if myrec.leader_ver == rec.leader_ver:
-                        self.resp( 200, ( None, None ) )
-                        return
-
-            rlog.catchup_queue.put( ( localleader.ident, localleader ) )
-            rlog.logger.debug( 'incorrect seq:' + repr( ( rlog.mylog.seq, req[ 'seq' ] ) ) )
-            self.resp_udf_err( 'IncorrectSeq', rlog.mylog.seq, req[ 'seq' ] )
+            return self.resp( 200, ( rlog.local_acc_seq, None ) )
 
     def h_commit( self ):
 
@@ -313,12 +247,16 @@ class ReliableLog( paxos.PaxosBase ):
         self.leader_queue.put( self.leader )
         self.catchup_queue = Queue.Queue( 1024 )
         self.commit_queue = Queue.Queue( 10240 )
-        self.msg_queue = Queue.Queue( 10240 )
+        self.p2_send_q = Queue.Queue( 10240 )
         self.catchingup = False
+
+        self.mem_acc_seqs = {}
+        self.waiting_evs = []
 
         self.status = ()
 
-        self.p2_seq = 0
+        self.local_acc_seq = 0
+        self.group_acc_seq = 0
         self.commit_seq = 0
 
         self.leader_lock = threading.RLock()
@@ -438,7 +376,8 @@ class ReliableLog( paxos.PaxosBase ):
                 commit_seq  = self.mylog.seq
 
             self.commit_seq = commit_seq
-            self.p2_seq = self.commit_seq
+            self.local_acc_seq = self.commit_seq
+            self.group_acc_seq = self.commit_seq
 
 
         self.pause_log_rw = False
@@ -448,37 +387,139 @@ class ReliableLog( paxos.PaxosBase ):
         self.cmt_th = paxos.daemon_thread( self.commit_worker )
         self.commit_th = paxos.daemon_thread( self.q_commit )
 
-        self.msg_q_th_1 = paxos.daemon_thread( self.q_msg )
-        self.msg_q_th_2 = paxos.daemon_thread( self.q_msg )
+        self.p2_send_th = paxos.daemon_thread( self.p2_send_worker )
 
         self.logger.info( self.ident + ' Starting up finished' )
 
         return None, None
 
-    def q_msg( self ):
+
+    def p2_send_worker( self ):
 
         while self.rlog_running:
 
             try:
-                elt = self.msg_queue.get( timeout=0.1 )
+                elt = self.p2_send_q.get( timeout=0.1 )
             except Queue.Empty, e:
                 continue
 
-            self.logger.info( "Start...." )
-            t0 = paxos.make_ts()
+            leader, dst_id = elt
 
-            ident, rsts, ev, argkv = elt
+            with self.leader_lock:
 
-            node = self.cluster[ ident ]
+                if leader != self.leader:
+                    continue
+
+                # If leader has not yet changed, it is safe patch as many as
+                # possible records together into one reqest.
+                cur_seq = self.mem_acc_seqs[ dst_id ]
+                recs, err = self._collect_p2_recs( cur_seq )
+                if err:
+                    continue
+
+                if recs == []:
+                    self.logger.debug( self.ident
+                                       + ' No new record to /p2 to ' + dst_id
+                                       + repr( ( cur_seq, self.mylog.seq ) ) )
+                    continue
+
+
+            # TODO need to lock while ps sending?
+            p2req = paxos.dump( { 'leader': leader, 'recs': recs, } )
+            self.logger.info( self.ident + ' to ' + dst_id
+                              + ' /p2 ' + repr( recs ) )
+
+            node = self.cluster[ dst_id ]
             ip, port = node[ 'addrs' ][ 0 ]
-            resp, err = paxos.http( ip, port, **argkv )
+            acc_seq, err = paxos.http( ip, port, uri='/p2', body=p2req,
+                                      timeout=0.2 )
 
-            rsts.append( ( ident, resp, err ) )
-            ev.set()
-            t1 = paxos.make_ts()
+            if err:
+                self.logger.info( self.ident + ' ' + repr( err )
+                                  + ' while /p2 to ' + dst_id )
+                continue
+                # TODO inform requester
 
-            self.logger.info( "exec:" + repr( t1 - t0 ) )
+            self.logger.info( self.ident + ' ' + repr( (acc_seq, err) )
+                              + ' OK while /p2 to ' + dst_id )
 
+            with self.leader_lock:
+
+                # If leadership changed, local log or remote log might be changed.
+                # mem_acc_seqs might be changed too.
+                #
+                # Syncing data is no more this leader's responsibility
+
+                if leader != self.leader:
+                    continue
+
+                self.mem_acc_seqs[ dst_id ] = acc_seq
+                has_update = self.update_group_acc_seq_nolock()
+
+                if has_update:
+                    self.inform_waitings_nolock()
+                    self.commit_queue.put( ( leader, ) )
+                    self.logger.info( self.ident
+                                      + ' put to commit q: ' + repr( leader ) )
+
+    def update_group_acc_seq_nolock( self ):
+
+        seqs = self.mem_acc_seqs.values()
+        seqs.sort()
+        quorum = len( self.cluster )/2+1
+        seqs = seqs[ -quorum: ]
+
+        old = self.group_acc_seq
+        self.group_acc_seq = min( seqs )
+
+        if self.group_acc_seq != old:
+            self.logger.info( self.ident + ' group_acc_seq: '
+                              + repr(self.group_acc_seq) )
+            return True
+        else:
+            return False
+
+    def inform_waitings_nolock( self ):
+
+        q = self.waiting_evs
+        self.waiting_evs = []
+        n_noti = 0
+        for k, ev in q:
+            if k < self.group_acc_seq:
+                ev.set()
+                n_noti += 1
+            else:
+                self.waiting_evs.append( ( k, ev ) )
+
+        self.logger.info( self.ident
+                          + ' Notified: ' + repr( n_noti )
+                          + ' Waiting: ' + repr( len( self.waiting_evs ) ) )
+
+    def _collect_p2_recs( self, cur_seq ):
+
+        n = 20
+        recs = []
+
+        self.logger.debug( self.ident
+                           + ' Collect rec from seq: ' + repr( cur_seq )
+                           + ' mylog.seq: ' + repr( self.mylog.seq ) )
+
+        while cur_seq < self.mylog.seq and n > 0:
+
+            n -= 1
+
+            ( s, e, buf), err = self.mylog.read( cur_seq )
+            if err:
+                self.logger.error( repr( err )
+                                   + ' while reading log for p2_q' )
+                # TODO handle error
+                return None, err
+
+            rec = paxos.load( buf )
+            recs.append( ( cur_seq, rec ) )
+            cur_seq = e
+
+        return recs, None
 
     def q_commit( self ):
 
@@ -489,17 +530,36 @@ class ReliableLog( paxos.PaxosBase ):
             except Queue.Empty, e:
                 continue
 
+            ( leader, ) = elt
 
-            leader, seq = elt
+            with self.leader_lock:
 
-            commit_req = paxos.dump( { 'seq': seq,
+                toseq = self.group_acc_seq
+
+                if toseq == self.commit_seq:
+                    continue
+
+                self.logger.info( self.ident
+                                  + ' gonna commit: ' + repr( ( leader, self.commit_seq, toseq ) ) )
+
+
+                if leader == self.leader:
+                    _, err = self.commit_nolock( toseq )
+                    if err:
+                        continue
+                else:
+                    continue
+
+            commit_req = paxos.dump( { 'seq': toseq,
                                        'leader': leader, } )
 
-            (n_acc, errs), err = self.send_mes(
-                    '/commit', commit_req )
+            (n_acc, errs), err = self.send_mes( '/commit', commit_req )
+
+            self.logger.info( self.ident + ' result of commit: '
+                              + repr( (n_acc, errs) ) )
 
             if err:
-                self.logger.info( self.ident + ' Failure commit: '
+                self.logger.error( self.ident + ' Failure commit: '
                                   + repr( errs ) )
 
 
@@ -606,19 +666,36 @@ class ReliableLog( paxos.PaxosBase ):
                 time.sleep( 0.1 )
                 continue
 
+            if self.leader.ident != self.ident \
+                    or self.local_acc_seq == self.commit_seq:
+                time.sleep( 0.1 )
+                continue
+
+            commit_seq = self.commit_seq
+            time.sleep( 0.5 )
+
             if self.leader.ident == self.ident \
-                    and self.p2_seq > self.commit_seq:
+                    and commit_seq == self.commit_seq:
 
-                commit_seq = self.commit_seq
-                time.sleep( 0.5 )
+                self.logger.info( self.ident
+                                  + ' commit_seq does not change after 0.5 sec: ' + repr( (commit_seq, self.commit_seq) )
+                                  + ' Starting re-exec' )
 
-                if self.leader.ident == self.ident \
-                        and commit_seq == self.commit_seq:
+                with self.leader_lock:
 
-                    self.logger.info( self.ident + ' commit_seq does not change after 0.5 sec. Starting re-exec' )
+                    # self.leader changes without holding leader_lock
 
-                    rc, err = self.reexec()
-                    self.logger.info( self.ident + ' reexec_nolock err: ' + repr( err ) )
+                    leader = self.leader
+
+                    if leader.ident != self.ident:
+                        continue
+
+                    for ident in self.cluster:
+                        if ident != self.ident \
+                                and self.mem_acc_seqs[ ident ] < self.mem_acc_seqs[ self.ident ]:
+                            self.p2_send_q.put( ( leader, ident ) )
+                            self.logger.info( self.ident
+                                              + ' resched p2 to ' + ident )
 
             time.sleep( 0.1 )
 
@@ -633,7 +710,7 @@ class ReliableLog( paxos.PaxosBase ):
                 continue
 
             with self.leader_lock:
-                self.p2_seq = self.commit_seq
+                self.local_acc_seq = self.commit_seq
 
             if leader.ident not in ( None, self.ident ):
 
@@ -648,7 +725,10 @@ class ReliableLog( paxos.PaxosBase ):
                     return None, err
 
                 with self.leader_lock:
-                    self.p2_seq = self.mylog.seq
+                    self.local_acc_seq = self.mylog.seq
+                    for ident in self.cluster:
+                        self.mem_acc_seqs[ ident ] = self.commit_seq
+                    self.group_acc_seq = self.commit_seq
 
                 self.leader = leader
 
@@ -725,11 +805,75 @@ class ReliableLog( paxos.PaxosBase ):
 
                 rc, err = self.catchup_nolock( src_ident, leader=leader )
                 if err:
+                    self.logger.warn( self.ident + " catchup error: " + repr( err ) )
                     if err.err not in ( 'WrongLeader', ):
                         self.catchup_queue.put( ( src_ident, leader ) )
                 return rc, err
         finally:
             self.catchingup = False
+
+    def accept_nolock( self, fromleader, seq, rec ):
+
+        if fromleader != self.leader:
+            return None, Error( 'WrongLeader', (self.leader, fromleader) )
+
+        ver, leader_ver, v = rec
+
+        assert self.local_acc_seq <= self.mylog.seq
+
+        if self.local_acc_seq < seq:
+            self.catchup_queue.put( ( self.leader.ident, self.leader ) )
+            return None, Error( 'InvalidPhase2Seq', ( self.local_acc_seq, seq ) )
+
+        if self.local_acc_seq > seq:
+            return self.local_acc_seq, None
+
+        # self.local_acc_seq == seq
+
+        if seq == self.mylog.seq:
+            return self.do_accept_nolock( rec )
+
+        if seq < self.mylog.seq:
+            (myseq, mynext_seq, myrec), err = self.mylog.read( seq )
+            if err:
+                self.logger.debug( repr( err ) + ' while  p2' )
+                return None, err
+
+            myrec = LogRecord( *paxos.load( myrec ) )
+
+            self.logger.debug( self.ident + ' p2 existent rec: ' + repr( rec ) )
+            self.logger.debug( self.ident + ' p2 existent my : ' + repr( myrec ) )
+
+            if myrec.leader_ver == rec.leader_ver:
+                self.local_acc_seq = mynext_seq
+                self.mem_acc_seqs[ self.ident ] = self.local_acc_seq
+                return self.local_acc_seq, None
+            else:
+                rc, err = self.mylog.reset( seq )
+                if err:
+                    return None, err
+
+                return self.do_accept_nolock( rec )
+
+        # seq > self.mylog.seq
+        # Not possible seq == self.local_acc_seq > self.mylog.seq
+
+
+    def do_accept_nolock( self, rec ):
+
+        assert self.local_acc_seq == self.mylog.seq
+
+        self.logger.debug( self.ident + ' write from seq='
+                           + repr(self.local_acc_seq) )
+
+        logbuf = paxos.dump( rec )
+        (seq, next_seq), err = self.mylog.write( logbuf )
+        if err:
+            return None, err
+
+        self.local_acc_seq = next_seq
+        self.mem_acc_seqs[ self.ident ] = self.local_acc_seq
+        return self.local_acc_seq, None
 
 
     def __del__( self ):
@@ -762,71 +906,10 @@ class ReliableLog( paxos.PaxosBase ):
         self.commit_th.join()
         self.logger.debug( self.ident + ' commit_th joined' )
 
-        self.msg_q_th_1.join()
-        self.msg_q_th_2.join()
-        self.logger.debug( self.ident + ' msg_q_th_1/2 joined' )
+        self.p2_send_th.join()
+        self.logger.debug( self.ident + ' p2_send_th joined' )
 
         self.logger.info( self.ident + ' shutted down' )
-
-    def reexec( self ):
-        with self.leader_lock:
-            return self.reexec_nolock()
-
-    def reexec_nolock( self ):
-
-        seq = self.commit_seq
-
-        while self.rlog_running:
-
-            (seq, next_seq, buf), err = self.mylog.read( seq )
-            if err:
-                if err.err == 'OutofRange':
-                    self.logger.debug( repr( err ) + ' while read local log' )
-                    return None, None
-                else:
-                    self.logger.error( repr( err ) + ' while read local log' )
-                    return None, err
-
-            rec = LogRecord( *paxos.load( buf ) )
-            rc, err = self.reexcecute_rec_nolock( seq, next_seq, rec )
-            self.logger.info( self.ident + ' re-exec result: ' + repr( (seq, rc, err) ) )
-            if err:
-                self.logger.info( repr( err ) + ' while reexec' )
-                # maybe not enough quorum
-                return None, err
-
-            seq = next_seq
-
-        return None, None
-
-    def reexcecute_rec_nolock( self, seq, next_seq, rec ):
-
-        self.logger.debug( self.ident + ' Leader re-exe: ' + repr( ( seq, rec ) ) )
-
-        leader = self.leader
-        p2req = paxos.dump( { 'leader': leader,
-                              'seq': seq,
-                              'rec': rec } )
-
-        (n_acc, errs), err = self.send_mes( '/p2', p2req )
-        n_acc += 1 # 1 for leader itself
-
-
-        quorum = len(self.cluster) / 2 + 1
-        if n_acc < quorum:
-            err = ( 'QuorumError', errs )
-            return None, err
-
-        self.commit_nolock( seq )
-
-        commit_req = paxos.dump( { 'seq': seq,
-                                   'leader': leader, } )
-
-        (n_acc, errs), err = self.send_mes( '/commit', commit_req )
-        if err:
-            self.logger.info( self.ident + ' re-exec errors:' + repr( errs ) )
-
-        return None, None
 
 
     def catchup_nolock( self, src_ident, leader=None ):
@@ -869,7 +952,8 @@ class ReliableLog( paxos.PaxosBase ):
                 (_, next_seq), err = self.mylog.write( logbuf )
                 if err:
                     return None, err
-                self.p2_seq = next_seq
+                self.local_acc_seq = next_seq
+                self.mem_acc_seqs[ self.ident ] = self.local_acc_seq
 
                 self.logger.debug( self.ident + ' OK catch up new:' + repr( ( seq, logbuf ) ) )
                 rst[ 'end' ] = next_seq
@@ -881,7 +965,8 @@ class ReliableLog( paxos.PaxosBase ):
                     return None, err
                 if logbuf == mylogbuf:
                     self.logger.debug( self.ident + ' OK catch up existent:' + repr( ( seq, logbuf ) ) )
-                    self.p2_seq = next_seq
+                    self.local_acc_seq = next_seq
+                    self.mem_acc_seqs[ self.ident ] = self.local_acc_seq
                     rst[ 'end' ] = next_seq
                     rst[ 'n' ] += 1
                 else:
@@ -908,7 +993,8 @@ class ReliableLog( paxos.PaxosBase ):
                         ( _, next_seq ), err = self.mylog.write( logbuf )
                         if err:
                             return None, err
-                        self.p2_seq = next_seq
+                        self.local_acc_seq = next_seq
+                        self.mem_acc_seqs[ self.ident ] = self.local_acc_seq
                         rst[ 'end' ] = next_seq
                         rst[ 'n' ] += 1
                         self.logger.debug( self.ident + ' OK catch up new:' + repr( ( seq, logbuf ) ) )
@@ -922,7 +1008,7 @@ class ReliableLog( paxos.PaxosBase ):
                         return None, None
 
             if commit_seq > self.commit_seq:
-                rc, err = self.commit_nolock( seq )
+                rc, err = self.commit_nolock( _next_seq )
                 if err:
                     return None, err
 
@@ -931,31 +1017,26 @@ class ReliableLog( paxos.PaxosBase ):
 
     def commit_nolock( self, seq ):
 
-        self.logger.debug( self.ident + " to commit:" + repr( seq ) )
-        if self.commit_seq > seq:
+        self.logger.info( self.ident + " to commit:" + repr( seq ) )
+        if self.commit_seq >= seq:
             # already committed
             return None, None
 
-        if self.commit_seq < seq:
-            err = ( 'InvalidSeq', (self.commit_seq, seq) )
-            self.logger.debug( self.ident + " " + repr( err ) + ' while commit: ' + repr( seq ) )
-            # there might be a commit message gets lost
-            return None, err
+        assert self.local_acc_seq >= self.commit_seq
 
-        # if self.commit_seq == seq:
+        # if self.commit_seq <= seq:
 
-        if self.p2_seq > seq:
+        if self.local_acc_seq >= seq:
 
-            (myseq, mynext_seq, myrecbuf), err = self.mylog.read( seq )
-            if err:
-                return None, err
-
-            self.commit_seq = mynext_seq
-            self.logger.debug( self.ident + ' committed:' + repr(seq) )
+            self.commit_seq = seq
+            self.logger.debug( self.ident + ' committed to:' + repr(seq) )
             return None, None
 
         else:
-            return None, Error( 'SeqNotAccepted', ( self.p2_seq, seq ) )
+            err = Error( 'SeqNotAccepted', ( self.local_acc_seq, seq ) )
+            self.logger.error( self.ident + " " + repr( err )
+                             + ' while local commit: ' + repr( seq ) )
+            return None, err
 
 
     def send_mes( self, uri, body ):
