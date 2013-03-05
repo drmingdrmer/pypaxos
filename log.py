@@ -686,6 +686,7 @@ class Log( object ):
         buf = os.read( fd, self.block_size )
 
         if len( buf ) != self.block_size:
+            logger.error( "IncompleteBlock: i, buf: " + repr( ( i, buf ) ) )
             return none, Err( 'IncompleteBlock', rseq )
 
         block_first_seq, length, chksum = struct.unpack( '>QII', buf[ -self.tail_size: ] )
